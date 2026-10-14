@@ -144,31 +144,6 @@ def get_flashmla_ops() -> tuple[Callable, Callable] | None:
     return None
 
 
-def get_quant_flashmla_ops() -> tuple[Callable, Callable] | None:
-    """Find the two full-quant FlashMLA APIs in ops-transformer.
-
-    QuantFlashMLA is delivered independently from the floating-point operator,
-    so backend selection must test its own attention and device-metadata APIs.
-    Keep import failures from an installed package visible for the same reason
-    as :func:`get_flashmla_ops`.
-    """
-    if not _has_flashmla_module():
-        return None
-
-    try:
-        ops = import_module("cann_ops_transformer.ops")
-    except ModuleNotFoundError as exc:
-        if exc.name in ("cann_ops_transformer", "cann_ops_transformer.ops"):
-            return None
-        raise
-
-    attention_op = getattr(ops, "quant_flash_mla", None)
-    metadata_op = getattr(ops, "quant_flash_mla_metadata", None)
-    if callable(attention_op) and callable(metadata_op):
-        return attention_op, metadata_op
-    return None
-
-
 class PreprocessType(enum.Enum):
     NATIVE = "native"
     PROLOG_V3 = "prolog_v3"
@@ -420,7 +395,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # CPU views of runner-owned CpuGpuBuffers; never exact sequence lengths.
     req_topk_buffer_slots: torch.Tensor | None = None
     req_topk_buffer_active: torch.Tensor | None = None
-    req_topk_buffer_stable_prefixes: torch.Tensor | None = None
+    req_topk_buffer_generations: torch.Tensor | None = None
     copy_sfa_draft_index: int | None = None
     copy_sfa_restore_tails: bool = False
     offload_dummy: bool = False
@@ -499,14 +474,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_logits_indices=self.num_logits_indices,
             req_topk_buffer_slots=_slice_reqs(self.req_topk_buffer_slots),
             req_topk_buffer_active=_slice_reqs(self.req_topk_buffer_active),
-            req_topk_buffer_stable_prefixes=_slice_reqs(self.req_topk_buffer_stable_prefixes),
             copy_sfa_draft_index=self.copy_sfa_draft_index,
             offload_dummy=self.offload_dummy,
             replay_start=_slice_reqs(self.replay_start),
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
         )
-
 
 def filter_chunked_req_indices(
     seq_len: torch.Tensor,
