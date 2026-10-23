@@ -473,6 +473,10 @@ class NPUModelRunner(GPUModelRunner):
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config, kv_cache_config, sparse_cfg
             )
+            self.sparse_kv_offload_manager.prepare_host_kv_allocation(
+                device_id=torch.npu.current_device(),
+                dp_rank=int(self.vllm_config.parallel_config.data_parallel_index),
+            )
             self.model_state._offload_live_req_ids = self.req_states.req_id_to_index
             self.model_state._offload_draft_layer_names = (
                 getattr(self.speculator, "draft_attn_layer_names", set[str]()) - resident_draft_names
@@ -596,20 +600,25 @@ class NPUModelRunner(GPUModelRunner):
         if isinstance(zeroer, C8KVBlockZeroer):
             zeroer.entries.clear()
             self.kv_block_zeroer = zeroer.delegate
-        self._shared_engram_shutdown_pending = shared_embeddings
-        if not getattr(self, "_shared_engram_parent_stopped", False):
-            super().shutdown()
-            self._shared_engram_parent_stopped = True
-        first_error = None
-        for embedding in shared_embeddings:
-            try:
-                embedding.close_host_offload()
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
-        if first_error is not None:
-            raise first_error
-        self._shared_engram_shutdown_pending = []
+        try:
+            self._shared_engram_shutdown_pending = shared_embeddings
+            if not getattr(self, "_shared_engram_parent_stopped", False):
+                super().shutdown()
+                self._shared_engram_parent_stopped = True
+            first_error = None
+            for embedding in shared_embeddings:
+                try:
+                    embedding.close_host_offload()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+            self._shared_engram_shutdown_pending = []
+        finally:
+            manager = getattr(self, "sparse_kv_offload_manager", None)
+            if manager is not None:
+                manager.close()
 
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
