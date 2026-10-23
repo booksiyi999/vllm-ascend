@@ -89,17 +89,13 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_kv import (
     get_resident_dspark_layer_names,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
-    get_layerwise_reuse_layout,
+    apply_layerwise_kv_cache_plan,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     allocate_kv_offload_topk_profile_buffers,
-    d2h_record_source_ready,
-    d2h_retire,
     init_sparse_kv_offload_manager,
-    make_d2h_plan_launch_hook,
 )
 from vllm_ascend.hisparse.host_mirror import HostMirrorConnector, overlap_target_host_mirror
-from vllm_ascend.hisparse.pcp import adapt_pcp_hisparse_connector
 from vllm_ascend.kv_trace.kv_trace_runner import install_trace
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
@@ -129,7 +125,6 @@ from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_state,
-    initialize_kernel_block_table_buffers,
     skip_ring_state_update,
 )
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
@@ -398,7 +393,6 @@ class NPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         self._lmhead_pad_size = self._get_lmhead_pad_size(state) if state is not None and lmhead_tp_enable() else None
         output = super().sample_tokens(grammar_output)
-        d2h_record_source_ready(self)
         self._lmhead_pad_size = None
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).
@@ -501,19 +495,19 @@ class NPUModelRunner(GPUModelRunner):
             is_last_pp_rank=self.is_last_pp_rank,
             shared_kv_cache_layers=getattr(self, "shared_kv_cache_layers", None),
         )
-        reuse_layout = get_layerwise_reuse_layout(kv_cache_config)
-        if reuse_layout is not None:
-            persistent_draft_names = resident_draft_names.union(
-                getattr(kv_cache_config, "dspark_draft_layer_names", ()),
-                getattr(kv_cache_config, "dflash_draft_layer_names", ()),
-            )
-            if not reuse_layout.reused_cache_names.isdisjoint(persistent_draft_names):
-                raise ValueError("Persistent draft caches cannot rotate through target layerwise slots.")
+        # P also needs persistent prompt draft KV until D acknowledges its
+        # transfer. It must never alias target layerwise scratch buffers.
+        persistent_draft_names = resident_draft_names | set(getattr(kv_cache_config, "dspark_draft_layer_names", ()))
+        persistent_draft_names.update(getattr(kv_cache_config, "dflash_draft_layer_names", ()))
+        apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config, excluded_layer_names=persistent_draft_names)
         if sparse_cfg.enabled:
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config, kv_cache_config, sparse_cfg
             )
-            self.model_state.runner_plan_launch_d2h = make_d2h_plan_launch_hook(self)
+            self.sparse_kv_offload_manager.prepare_host_kv_allocation(
+                device_id=torch.npu.current_device(),
+                dp_rank=int(self.vllm_config.parallel_config.data_parallel_index),
+            )
             self.model_state._offload_live_req_ids = self.req_states.req_id_to_index
             self.model_state._offload_draft_layer_names = (
                 getattr(self.speculator, "draft_attn_layer_names", set[str]()) - resident_draft_names
@@ -522,17 +516,6 @@ class NPUModelRunner(GPUModelRunner):
             )
         with graph_manager_wrapper(self):
             self._initialize_kv_cache_upstream(kv_cache_config, kv_cache_allocation_context)
-            # PCP owns the local-row capacity; FIA may append one padding
-            # request for either target or draft metadata.
-            max_metadata_reqs = (
-                self.pcp_manager.max_num_local_reqs if self.pcp_manager is not None else self.max_num_reqs
-            ) + 1
-            metadata_groups = [*self.attn_groups, *getattr(self.speculator, "attn_groups", [])]
-            initialize_kernel_block_table_buffers(
-                (group for groups in metadata_groups for group in groups),
-                max_metadata_reqs,
-                [table.gpu.shape[1] for table in self.block_tables.block_tables],
-            )
             self._target_uses_flashmla = self._has_target_flashmla_attention()
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
@@ -614,7 +597,6 @@ class NPUModelRunner(GPUModelRunner):
 
         self._fill_c8_mxfp_v_scale_caches()
         if self.vllm_config.attention_config.hisparse_config is not None:
-            self.kv_connector = adapt_pcp_hisparse_connector(self)
             self.kv_connector = overlap_target_host_mirror(self)
         guard = getattr(self, "_kv_trace", None)
         if guard is not None:
@@ -658,36 +640,41 @@ class NPUModelRunner(GPUModelRunner):
         if isinstance(zeroer, C8KVBlockZeroer):
             zeroer.entries.clear()
             self.kv_block_zeroer = zeroer.delegate
-        self._shared_engram_shutdown_pending = shared_embeddings
-        if not getattr(self, "_shared_engram_parent_stopped", False):
-            super().shutdown()
-            self._shared_engram_parent_stopped = True
-        first_error = None
-        for embedding in shared_embeddings:
-            if getattr(embedding, "local_vmm", False) is True:
-                continue
-            try:
-                embedding.close_host_offload()
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
-        if first_error is not None:
-            raise first_error
-        pending = [owner for owner in shared_embeddings if getattr(owner, "local_vmm", False) is True]
-        self._shared_engram_shutdown_pending = pending
-        if pending:
-            from vllm_ascend.models.deepseek_v41.engram.local_shared_vmm import EngramSharedReleaseError
-
-            errors = []
-            for index in range(len(pending) - 1, -1, -1):
+        try:
+            self._shared_engram_shutdown_pending = shared_embeddings
+            if not getattr(self, "_shared_engram_parent_stopped", False):
+                super().shutdown()
+                self._shared_engram_parent_stopped = True
+            first_error = None
+            for embedding in shared_embeddings:
+                if getattr(embedding, "local_vmm", False) is True:
+                    continue
                 try:
-                    pending[index].close_host_offload()
-                except EngramSharedReleaseError as exc:
-                    errors.append(str(exc))
-                else:
-                    del pending[index]
-            if errors:
-                raise EngramSharedReleaseError("; ".join(errors))
+                    embedding.close_host_offload()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+            pending = [owner for owner in shared_embeddings if getattr(owner, "local_vmm", False) is True]
+            self._shared_engram_shutdown_pending = pending
+            if pending:
+                from vllm_ascend.models.deepseek_v41.engram.local_shared_vmm import EngramSharedReleaseError
+
+                errors = []
+                for index in range(len(pending) - 1, -1, -1):
+                    try:
+                        pending[index].close_host_offload()
+                    except EngramSharedReleaseError as exc:
+                        errors.append(str(exc))
+                    else:
+                        del pending[index]
+                if errors:
+                    raise EngramSharedReleaseError("; ".join(errors))
+        finally:
+            manager = getattr(self, "sparse_kv_offload_manager", None)
+            if manager is not None:
+                manager.close()
 
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
@@ -783,7 +770,6 @@ class NPUModelRunner(GPUModelRunner):
         profile_kwargs = {"randomize_inputs": randomize_inputs}
         forward_failed = True
         with dp_coordination_context:
-            d2h_retire(self, getattr(scheduler_output, "preempted_req_ids", None))
             try:
                 output = super().execute_model(
                     scheduler_output,
@@ -997,7 +983,7 @@ class NPUModelRunner(GPUModelRunner):
             adaptive_verification_manager is not None and num_draft_tokens_per_req is not None
         )
         num_scheduled_tokens_upper_bound = num_scheduled_tokens_np
-        num_admitted_draft_tokens = None
+        admitted_draft_kwargs = {}
         if adaptive_verification_active:
             num_scheduled_tokens_np, cu_num_logits_np = adaptive_verification_manager.compact_batch(
                 num_draft_tokens_per_req, num_scheduled_tokens_np, cu_num_logits_np
@@ -1032,12 +1018,10 @@ class NPUModelRunner(GPUModelRunner):
         if adaptive_verification_active:
             num_scheduled_draft_tokens = total_num_draft_tokens
             self._log_adaptive_verification_costs(adaptive_verification_manager)
-            (
-                cu_num_logits,
-                query_start_loc,
-                total_num_draft_tokens,
-                num_admitted_draft_tokens,
-            ) = adaptive_verification_manager.reallocate_drafts(req_ids, idx_mapping)
+            allocation = adaptive_verification_manager.reallocate_drafts(req_ids, idx_mapping)
+            cu_num_logits, query_start_loc, total_num_draft_tokens = allocation[:3]
+            if len(allocation) == 4:
+                admitted_draft_kwargs["num_admitted_draft_tokens"] = allocation[3]
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
             logger.debug(
                 "Adaptive verification budget: requests=%d, scheduled_drafts=%d, admitted_drafts=%d, "
@@ -1145,6 +1129,8 @@ class NPUModelRunner(GPUModelRunner):
             # prompt_lens is only used in R-SWA case.
             prompt_lens = self.req_states.prompt_len.gpu[idx_mapping]
 
+        pp_kwargs = {"max_seq_len_np": batch_req_state.max_seq_len_np}
+        pp_kwargs.update(admitted_draft_kwargs)
         input_batch = AscendInputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -1158,7 +1144,6 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding=num_tokens_after_padding,
             num_draft_tokens=total_num_draft_tokens,
             num_draft_tokens_per_req=num_draft_tokens_per_req,
-            num_admitted_draft_tokens=num_admitted_draft_tokens,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
@@ -1171,7 +1156,7 @@ class NPUModelRunner(GPUModelRunner):
             has_prefill=batch_req_state.has_prefill,
             decode_graph_eligible=batch_req_state.decode_graph_eligible,
             prefill_runs_as_decode_np=batch_req_state.prefill_runs_as_decode_np,
-            max_seq_len_np=batch_req_state.max_seq_len_np,
+            **pp_kwargs,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=self.prepare_padding_mask(num_tokens, num_tokens_after_padding),
