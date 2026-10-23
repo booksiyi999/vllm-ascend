@@ -311,6 +311,17 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata.copy_sfa_reuse_logical_lens = None
         metadata.copy_sfa_copy_src_offsets = None
         if not self.use_fused_copy_sfa:
+            # The normalization below only runs on the fused copy path. Without
+            # it a decode-only batch keeps the ChunkedPrefill state that
+            # build_attn_state derives from its multi-token query, so the sparse
+            # offload mistakes the MTP draft/verify step for prefill and refuses
+            # to read the offloaded device KV cache.
+            if num_prefills == 0 and num_decodes > 0:
+                metadata.attn_state = (
+                    AscendAttentionState.SpecDecoding
+                    if common_attn_metadata.max_query_len > 1
+                    else AscendAttentionState.DecodeOnly
+                )
             return metadata
         if draft_index is None:
             draft_index = getattr(common_attn_metadata, "copy_sfa_draft_index", None)
@@ -1101,7 +1112,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             or self._fused_overlap_selection_capacity[3] < cache_blocks_per_row
             or self.selection_kv_block_table.device != device
             or self.selection_kv_block_status.device != device
-            or self.selection_membership_map.device.type != "cpu"
+            or not get_sparse_kv_offload_manager().is_fused_membership_storage(self.selection_membership_map)
             or self.fused_overlap_last_req_ids.device != device
         )
         if needs_realloc:
