@@ -144,6 +144,45 @@ def get_flashmla_ops() -> tuple[Callable, Callable] | None:
     return None
 
 
+def get_quant_flashmla_ops() -> tuple[Callable, Callable] | None:
+    """Find the two full-quant FlashMLA APIs in ops-transformer.
+
+    QuantFlashMLA is delivered independently from the floating-point operator,
+    so backend selection must test its own attention and device-metadata APIs.
+    Keep import failures from an installed package visible for the same reason
+    as :func:`get_flashmla_ops`.
+    """
+    if not _has_flashmla_module():
+        return None
+
+    try:
+        ops = import_module("cann_ops_transformer.ops")
+    except ModuleNotFoundError as exc:
+        if exc.name in ("cann_ops_transformer", "cann_ops_transformer.ops"):
+            return None
+        raise
+
+    attention_op = getattr(ops, "quant_flash_mla", None)
+    metadata_op = getattr(ops, "quant_flash_mla_metadata", None)
+    if callable(attention_op) and callable(metadata_op):
+        return attention_op, metadata_op
+    return None
+
+
+def is_pcp_decode_sharding_enabled(vllm_config) -> bool:
+    """Compat shim kept after the upstream common_cp refactor.
+
+    Upstream inlined the check (see context_parallel/dsa_cp.py); kernel_v2
+    keeps the KPool replicated-decode guard, so the old decision logic is
+    preserved here and imported by sfa_v1/mla_v1.
+    """
+    from vllm_ascend.utils import model_uses_kpool_indexer
+
+    if model_uses_kpool_indexer(getattr(vllm_config, "model_config", None)):
+        return False
+    return vllm_config.parallel_config.pcp_shard_decode_requests
+
+
 class PreprocessType(enum.Enum):
     NATIVE = "native"
     PROLOG_V3 = "prolog_v3"
@@ -395,6 +434,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # CPU views of runner-owned CpuGpuBuffers; never exact sequence lengths.
     req_topk_buffer_slots: torch.Tensor | None = None
     req_topk_buffer_active: torch.Tensor | None = None
+    req_topk_buffer_stable_prefixes: torch.Tensor | None = None
     req_topk_buffer_generations: torch.Tensor | None = None
     copy_sfa_draft_index: int | None = None
     copy_sfa_restore_tails: bool = False
@@ -474,6 +514,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_logits_indices=self.num_logits_indices,
             req_topk_buffer_slots=_slice_reqs(self.req_topk_buffer_slots),
             req_topk_buffer_active=_slice_reqs(self.req_topk_buffer_active),
+            req_topk_buffer_stable_prefixes=_slice_reqs(self.req_topk_buffer_stable_prefixes),
             copy_sfa_draft_index=self.copy_sfa_draft_index,
             offload_dummy=self.offload_dummy,
             replay_start=_slice_reqs(self.replay_start),

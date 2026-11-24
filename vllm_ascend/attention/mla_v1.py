@@ -33,10 +33,8 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.context_parallel.common_cp import (
-    get_pcp_num_replicated_tokens,
-    is_pcp_decode_sharding_enabled,
-)
+from vllm_ascend.attention.context_parallel.common_cp import get_pcp_num_replicated_tokens
+from vllm_ascend.attention.utils import is_pcp_decode_sharding_enabled
 from vllm_ascend.attention.flashmla import (
     FLASHMLA_QK_DIM,
     FLASHMLA_V_DIM,
