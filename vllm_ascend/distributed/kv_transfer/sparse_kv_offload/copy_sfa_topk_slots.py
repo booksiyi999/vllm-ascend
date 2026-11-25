@@ -88,20 +88,20 @@ def prepare_copy_sfa_request_slots(
     hot_tokens: int,
     dummy: bool,
     restore_new_requests: bool = False,
-) -> tuple[dict[str, int], int, bool, dict[int, tuple[int, int]]]:
+) -> tuple[dict[str, int], int, bool, dict[int, tuple[int, int, int]]]:
     """Prepare CPU row ownership and return updated state plus rollback work.
 
     ``req_ids`` contains the rows in this batch. Pass the full CPU slot and
     generation buffer views, whose length is the real-row pool capacity.
     Slot generations and prefix history update in place. The result contains
     the retained request mapping, generation counter, tail-restore flag and
-    dense fills as ``slot -> (batch row, computed tokens)``. The caller owns
+    dense fills as ``slot -> (batch row, tokens, source block)``. The caller owns
     these buffers/maps and submits any returned dense fills to the manager.
     """
     capacity = len(slots)
     prepare_copy_sfa_dummy_slots(slots, generations, padded_reqs)
     restore_tails = False
-    dense_fills: dict[int, tuple[int, int]] = {}
+    dense_fills: dict[int, tuple[int, int, int]] = {}
     if not dummy:
         # PD binds rows at alloc time. Keep those reservations even when the
         # request is waiting for KV and is not in the current decode batch.
@@ -120,8 +120,14 @@ def prepare_copy_sfa_request_slots(
                 if restore_new_requests and computed_tokens is not None:
                     computed = int(computed_tokens[row])
                     if computed <= hot_tokens:
-                        dense_fills[slot] = (row, computed)
-                    else:
+                        dense_fills[slot] = (row, computed, 0)
+                    elif hot_tokens:
+                        # Rebuild the sliding-window hot region from the
+                        # host-pool blocks ending at the computed prefix;
+                        # the circular ring keeps the tail restore.
+                        window = min(computed, hot_tokens)
+                        prefix = (computed // block_size) * block_size
+                        dense_fills[slot] = (row, window, (prefix - window) // block_size)
                         restore_tails = True
                 # Colocated prefill populates the row in exec_kv. Existing PD
                 # connectors deliver the full prompt into the Host pool and
@@ -139,7 +145,7 @@ def prepare_copy_sfa_request_slots(
                     # A rollback across the hot boundary leaves a sparse-layout
                     # row under a dense (-3) reader: refill the whole row.
                     if hot_tokens and last_prefix >= hot_tokens > prefix:
-                        dense_fills[slot] = (row, int(computed_tokens[row]))
+                        dense_fills[slot] = (row, int(computed_tokens[row]), 0)
                 last_prefixes[slot] = prefix
     return request_slots, generation, restore_tails, dense_fills
 
@@ -180,7 +186,7 @@ class CopySfaRequestStates:
         hot_tokens: int,
         dummy: bool,
         lim_cache_histories: Sequence[Tensor],
-    ) -> tuple[bool, dict[int, tuple[int, int]], tuple[int, ...]]:
+    ) -> tuple[bool, dict[int, tuple[int, int, int]], tuple[int, ...]]:
         """Return tail restoration, dense fills, and slots needing LIM reset."""
         capacity = len(slots)
         if not 0 <= len(req_ids) <= padded_reqs <= capacity or len(active) != capacity:
@@ -241,7 +247,7 @@ class CopySfaRequestStates:
         retained.update(pending)
         self._requests = retained
         restore_tails = False
-        dense_fills: dict[int, tuple[int, int]] = {}
+        dense_fills: dict[int, tuple[int, int, int]] = {}
         for row, req in enumerate(req_ids):
             state = retained[req]
             slots[row] = state.slot
@@ -254,15 +260,21 @@ class CopySfaRequestStates:
                 if prebound_slots:
                     restore_tails = True
                 if hot_tokens and state.last_prefix >= hot_tokens > prefix:
-                    dense_fills[state.slot] = (row, computed)
+                    dense_fills[state.slot] = (row, computed, 0)
             elif state.last_prefix is None and computed > 0:
                 # Colocated prefill populates the row in exec_kv and starts at
                 # computed == 0. PD connectors deliver the full prompt into the
                 # Host pool instead, so Decode needs one eager restore when it
                 # first owns the row (see prepare_copy_sfa_request_slots).
+                # Rebuild the whole row: dense-fill the sliding-window hot
+                # region from the host-pool blocks ending at the computed
+                # prefix; the circular ring keeps the tail restore.
                 if computed <= hot_tokens:
-                    dense_fills[state.slot] = (row, computed)
+                    dense_fills[state.slot] = (row, computed, 0)
                 else:
+                    window = min(computed, hot_tokens)
+                    if window > 0:
+                        dense_fills[state.slot] = (row, window, (prefix - window) // block_size)
                     restore_tails = True
             state.last_prefix = prefix
         return restore_tails, dense_fills, invalidated_slots
