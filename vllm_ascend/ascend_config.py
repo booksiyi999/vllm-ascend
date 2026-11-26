@@ -1867,8 +1867,6 @@ class SparseKVOffloadConfig:
             raise ValueError("sparse_kv_offload_config.store_port_base must be a valid TCP port")
 
         if self.enabled and self.host_backend == "mooncake":
-            if not self.use_fused_overlap:
-                raise ValueError("sparse_kv_offload_config.host_backend='mooncake' requires use_fused_overlap=true")
             if self.keep_device_kv_cache:
                 raise ValueError(
                     "sparse_kv_offload_config.host_backend='mooncake' is only supported for "
@@ -1911,19 +1909,19 @@ class SparseKVOffloadConfig:
         if parallel_config.pipeline_parallel_size > 1:
             raise ValueError("Sparse KV offload don't support pipeline parallel now.")
         if self.keep_device_kv_cache:
-            logger.warning_once(
-                "Init sparse KV offload with keep_device_kv_cache enabled, "
-                "in this case we will still allocate device kv cache "
-                "and can not improve sequence length or batch_size. "
-                "You should only use it for debugging in PD colocate scenario."
+            # PD colocate debug mode is not supported: sparse KV offload only
+            # supports PD-disaggregated decode. Reject it outright so the
+            # colocate code paths can never be entered.
+            raise ValueError(
+                "sparse_kv_offload_config.keep_device_kv_cache=True (PD colocate debug mode) "
+                "is not supported; Sparse KV offload only supports PD-disaggregated decode. "
+                "Set keep_device_kv_cache=false."
             )
-        else:
-            if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:
-                raise AssertionError(
-                    "Sparse KV offload is only supported in PD disaggregate scenario "
-                    "and can only be used in D node. For debugging in PD colocate scenario, "
-                    "you can enable keep_device_kv_cache."
-                )
+        if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:
+            raise AssertionError(
+                "Sparse KV offload is only supported in PD disaggregate scenario "
+                "and can only be used in D node."
+            )
         self.topk = vllm_config.model_config.hf_text_config.index_topk
         speculative = getattr(vllm_config, "speculative_config", None)
         if (

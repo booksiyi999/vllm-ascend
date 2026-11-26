@@ -1380,6 +1380,31 @@ class TestSparseKVOffloadConfig(TestBase):
                 },
             )
 
+    def test_colocate_staging_is_rejected_for_all_host_backends(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=128)),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            kv_transfer_config=None,
+        )
+        for host_backend in ("memfabric", "mooncake"):
+            with (
+                self.subTest(host_backend=host_backend),
+                self.assertRaisesRegex(ValueError, "keep_device_kv_cache"),
+            ):
+                SparseKVOffloadConfig.from_additional_config(
+                    vllm_config,
+                    {
+                        "enabled": "true",
+                        "host_backend": host_backend,
+                        "use_fused_overlap": "true",
+                        "keep_device_kv_cache": "true",
+                    },
+                )
+
     def test_mooncake_host_backend_valid_config_passes_validation(self):
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=128)),
